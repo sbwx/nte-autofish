@@ -3,7 +3,7 @@
 auto fishing script for neverness to everness.
 
 watches the screen, casts when it can, plays the minigame when a fish
-bites, dismisses the catch screen, repeat.
+bites, dismisses the catch screen, repeat. Does not auto buy bait or anything so buy a ton of bait and then leave it running.
 
 ## install
 
