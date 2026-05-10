@@ -53,10 +53,18 @@ class Config:
     # Just the F bubble. Used to detect HOOK_READY by the bright blue ring
     # the game draws around it once a fish is on the line.
     roi_hook_button: tuple = (1750, 905, 80, 75)
-    # Top-center fishing bar — narrowed to just the bar region (excludes the
-    # fish-stamina and line-tension end-cap icons so their colors don't bleed
-    # into the target/slider masks).
-    roi_reel_gauge: tuple = (770, 60, 380, 50)
+    # Top-center fishing bar — clamped tightly to just the *inner* track
+    # between the two end-cap circles. This is critical: the fish-stamina
+    # ring on the left is bright yellow (matches the slider HSV) and the
+    # line-tension ring on the right is cyan (matches the target HSV). If
+    # the ROI grazes either circle, the slider centroid gets dragged toward
+    # one edge and the target span balloons across the whole ROI.
+    # If runtime logs show slider_px stuck at a constant value frame-after-
+    # frame, the left circle is still leaking in — push x right by ~30.
+    # Height is held to 24: any taller and the rows above/below the bar
+    # start including sky pixels, which can match (especially the slider
+    # HSV when the sun/clouds are visible).
+    roi_reel_gauge: tuple = (840, 78, 240, 24)
     # Pink/magenta XP bar that appears at the very top of the catch dialog.
     # Most distinctive non-blurred element on the catch screen.
     roi_catch_screen: tuple = (760, 80, 400, 80)
@@ -84,14 +92,20 @@ class Config:
         lower=(95, 150, 180), upper=(120, 255, 255)
     ))
 
-    # Teal/cyan-green moving segment in the reeling gauge.
+    # Teal/cyan-green moving segment in the reeling gauge. Tight enough
+    # to reject sky (which leans more H~100..110, S~50..150). DO NOT widen
+    # this — it sits behind a top-of-screen ROI where any cyan-ish sky
+    # tint will flood the mask and pin the script in REELING from launch.
     hsv_target_zone: HSVRange = field(default_factory=lambda: HSVRange(
-        lower=(80, 100, 150), upper=(95, 255, 255)
+        lower=(80, 130, 120), upper=(98, 255, 255)
     ))
 
-    # Yellow vertical slider line in the reeling gauge. Saturated, very bright.
+    # Yellow vertical slider line in the reeling gauge. Modest widening
+    # vs. the original (S 100 instead of 120, V 150 instead of 180) so
+    # anti-aliased slider edges register without falling so loose that the
+    # sun/clouds light up the mask at a fixed position.
     hsv_slider: HSVRange = field(default_factory=lambda: HSVRange(
-        lower=(22, 150, 200), upper=(35, 255, 255)
+        lower=(15, 100, 150), upper=(38, 255, 255)
     ))
 
     # Pink/magenta XP fill on the catch dialog's level bar.
@@ -104,25 +118,45 @@ class Config:
     # so 200 requires meaningfully more than a single bubble's worth.
     idle_min_pixels: int = 200
     hook_min_pixels: int = 60        # thin blue ring is sparse
-    reel_target_min_pixels: int = 25 # min teal pixels to call it REELING
-    reel_slider_min_pixels: int = 15 # min yellow pixels for slider centroid
-    catch_min_pixels: int = 200      # bright XP bar fill
+    # Asymmetric hysteresis on REELING: the *enter* threshold needs to be
+    # convincing (the catch screen also has some teal that we don't want to
+    # confuse for the gauge), but once we're reeling we want to *stay* even
+    # through brief detector dips when the target slides off the ROI edge.
+    reel_target_min_pixels: int = 25     # to ENTER REELING
+    reel_target_stay_min_pixels: int = 5  # to STAY in REELING
+    reel_slider_min_pixels: int = 5  # min yellow pixels for slider centroid
+    # Real catch dialogs produce 10k+ pink pixels. The threshold is set high
+    # to reject the fading dialog after dismissal and to reject any small
+    # pink/red UI elements (LIVE indicators, etc.) in other states.
+    catch_min_pixels: int = 3000
 
     # ---- Reel controller ----
-    # Hysteresis deadzone in normalized gauge units (0..1). The slider must
-    # cross past target_start - dz / target_end + dz before the controller
-    # flips state. Larger => calmer. Smaller => tighter tracking.
-    reel_deadzone: float = 0.06
+    # Deadzone around the *target center* in normalized ROI units (0..1).
+    # The controller pushes the slider toward the target's center and only
+    # releases both keys when the slider is within `deadzone * roi_w` of
+    # the center. Smaller => tighter tracking but more oscillation.
+    reel_deadzone: float = 0.02
     reel_tick_seconds: float = 0.012     # loop period inside the minigame
     reel_timeout_seconds: float = 30.0   # bail out if a reel never finishes
     gauge_lost_grace: float = 0.6        # gauge must be gone this long => done
+    # If the matched teal span covers more than this fraction of the ROI,
+    # we treat it as noise (likely water/sky bleed) and fall back to the
+    # last good span. Tighten this if the controller drifts on bad frames.
+    reel_target_max_span_ratio: float = 0.85
+    reel_log_seconds: float = 0.25       # throttle for per-tick reel log
 
     # ---- Catch dismissal ----
-    # Window-relative coords for the click that closes the catch dialog. The
-    # top-left of the play area is reliably empty in all four reference shots.
-    catch_dismiss_point: tuple = (100, 100)
+    # Window-relative coords for the click that closes the catch dialog.
+    # Avoid (100, 100) because the friends-list / streamer indicators on the
+    # IDLE screen sit near there and clicking them can open menus that the
+    # script then misreads. (50, 540) is well below the indicator stack and
+    # to the left of the player character.
+    catch_dismiss_point: tuple = (50, 540)
     catch_max_dismiss_attempts: int = 3
-    catch_dismiss_delay: float = 0.4
+    # The dialog fades out over ~1s after the click. Wait long enough that
+    # the next state poll doesn't catch the tail of the fade as another
+    # catch screen.
+    catch_dismiss_delay: float = 1.5
 
     # ---- State timing ----
     cast_poll_seconds: float = 0.25

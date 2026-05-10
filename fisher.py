@@ -60,6 +60,7 @@ class Fisher:
         self._catches = 0
         self._misses = 0
         self._last_diag_log = 0.0
+        self._last_reel_log = 0.0
         # When set, suppress action on lower-priority states until this time
         # (used to give the game a beat to repaint after we press a key).
         self._action_lockout_until = 0.0
@@ -179,11 +180,19 @@ class Fisher:
             return State.CATCH_SCREEN, diag
 
         # REELING — teal target segment in the bar is unique to the minigame.
+        # Asymmetric hysteresis: high bar to ENTER, low bar to STAY. Stops
+        # the state from bouncing reeling↔unknown when the target briefly
+        # slides off the ROI edge.
         reel_px = self._mask_count(
             self.cfg.roi_reel_gauge, self.cfg.hsv_target_zone, "reel_target"
         )
         diag["reel_target"] = reel_px
-        if reel_px >= self.cfg.reel_target_min_pixels:
+        threshold = (
+            self.cfg.reel_target_stay_min_pixels
+            if self.state == State.REELING
+            else self.cfg.reel_target_min_pixels
+        )
+        if reel_px >= threshold:
             return State.REELING, diag
 
         # HOOK_READY — bright blue ring around F bubble. Check before IDLE
@@ -239,7 +248,17 @@ class Fisher:
         target_span = self.vision.horizontal_extent(target_mask)
         slider_centroid = self.vision.centroid(slider_mask)
 
+        target_pixels = int(cv2.countNonZero(target_mask))
         slider_pixels = int(cv2.countNonZero(slider_mask))
+
+        # Reject suspiciously wide target spans — if the teal mask matches
+        # most of the ROI we're picking up noise (sky/water bleed), not the
+        # actual segment.
+        if target_span is not None:
+            span_w = target_span[1] - target_span[0]
+            if span_w > self.cfg.reel_target_max_span_ratio * roi.shape[1]:
+                target_span = None
+
         if target_span is not None:
             self._last_target_span = target_span
         if slider_centroid is not None and slider_pixels >= self.cfg.reel_slider_min_pixels:
@@ -252,23 +271,51 @@ class Fisher:
             else self._last_slider_x
         )
 
+        decision = "no-data"
         if span is not None and slider_x is not None:
-            self._apply_controller(roi.shape[1], span, slider_x)
+            decision = self._apply_controller(roi.shape[1], span, slider_x)
+
+        self._maybe_log_reel(roi.shape[1], target_pixels, slider_pixels,
+                             span, slider_x, decision)
 
         if self.cfg.debug_mode:
             self._render_debug(roi, target_mask, slider_mask, span, slider_x)
 
-    def _apply_controller(self, roi_w: int, target_span: tuple, slider_x: float):
+    def _maybe_log_reel(self, roi_w, target_pixels, slider_pixels,
+                        span, slider_x, decision):
+        now = time.monotonic()
+        if now - self._last_reel_log < self.cfg.reel_log_seconds:
+            return
+        self._last_reel_log = now
+        held = ("A" if self._a_down else "-") + ("D" if self._d_down else "-")
+        span_s = f"{span[0]}-{span[1]}" if span else "None"
+        sx_s = f"{slider_x:.0f}" if slider_x is not None else "None"
+        print(f"[reel] roi_w={roi_w} target_px={target_pixels} slider_px={slider_pixels}"
+              f" span={span_s} slider_x={sx_s} keys={held} -> {decision}")
+
+    def _apply_controller(self, roi_w: int, target_span: tuple, slider_x: float) -> str:
+        """Aim the slider at the *center* of the target zone.
+
+        Pushing toward the band edges (the previous behaviour) leaves the
+        slider resting against the inside edge of the band — and as the
+        band drifts, that edge becomes the outside, so the slider is
+        constantly almost-out. Pushing toward the center keeps the slider
+        in the middle, where it has maximum margin in both directions.
+        """
         t_start, t_end = target_span
+        target_center = (t_start + t_end) / 2.0
         dz = self.cfg.reel_deadzone * roi_w
-        if slider_x < t_start - dz:
+        if slider_x < target_center - dz:
             self._release_left()
             self._hold_right()
-        elif slider_x > t_end + dz:
+            return f"push-right(D) center={target_center:.0f}"
+        elif slider_x > target_center + dz:
             self._release_right()
             self._hold_left()
+            return f"push-left(A) center={target_center:.0f}"
         else:
             self._release_reel_keys()
+            return f"centered(release) center={target_center:.0f}"
 
     def _do_catch_screen(self):
         cx, cy = self.cfg.catch_dismiss_point
@@ -305,8 +352,12 @@ class Fisher:
         # Always lift reel keys when leaving REELING.
         if prev == State.REELING:
             self._release_reel_keys()
-            self._last_slider_x = None
-            self._last_target_span = None
+        # Don't clear _last_slider_x / _last_target_span here — keep them as
+        # a warm cache. If the next reel starts within a few seconds (very
+        # common, since brief detection dips can briefly drop us out of
+        # REELING and right back in), the controller has fallback values
+        # for the first few ticks until fresh detections arrive. Stale
+        # values get overwritten on the first successful detection.
         if new == State.CATCH_SCREEN and prev == State.REELING:
             self._catches += 1
         print(f"[state] {prev.value} -> {new.value}")
