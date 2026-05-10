@@ -7,6 +7,19 @@ bites, dismisses the catch screen, repeat. Does not auto buy bait or anything so
 
 ## install
 
+windows only.
+
+from a fresh windows machine:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+this checks for python, installs it via winget if missing, makes a venv
+and installs the packages.
+
+if you already have python:
+
 ```bash
 pip install -r requirements.txt
 ```
