@@ -176,6 +176,15 @@ class Fisher:
             mask[:, :edge] = 0
             mask[:, -edge:] = 0
 
+    def _catch_text_count(self) -> int:
+        """count white pixels in the dismissal-text strip at the bottom
+        of the catch dialog. independent of xp level and time of day,
+        so this works even when the pink xp bar is tiny (low-level
+        users) or when the sky is dark (night fishing)."""
+        return self._mask_count(
+            self.cfg.roi_catch_text, self.cfg.hsv_bubble_icon, "catch_text"
+        )
+
     def _reel_target_count(self, debug_name: Optional[str] = None) -> int:
         """count only the biggest teal chunk. the right-side icon also
         has some teal but it's tiny next to the actual target rectangle,
@@ -197,11 +206,18 @@ class Fisher:
 
         # check the catch screen first. when it's up it covers most of
         # the screen so we don't want to act on anything else.
+        # two independent signals, either one fires:
+        #   1. pink xp bar pixels (varies a lot with the user's xp level)
+        #   2. white dismissal text (always there regardless of xp / time
+        #      of day / fish type / grade)
         catch_px = self._mask_count(
             self.cfg.roi_catch_screen, self.cfg.hsv_catch_xp_bar, "catch_screen"
         )
+        catch_text_px = self._catch_text_count()
         diag["catch"] = catch_px
-        if catch_px >= self.cfg.catch_min_pixels:
+        diag["catch_text"] = catch_text_px
+        if (catch_px >= self.cfg.catch_min_pixels
+                or catch_text_px >= self.cfg.catch_text_min_pixels):
             return State.CATCH_SCREEN, diag
 
         # reeling. teal target only shows up during the minigame.

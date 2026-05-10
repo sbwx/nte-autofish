@@ -61,9 +61,16 @@ class Config:
     # screen pixels, not the 1920x1080 numbers above). only applied to
     # the yellow mask.
     reel_edge_mask_px: int = 35
-    # the pink xp bar at the top of the catch dialog. easiest thing to
-    # spot on that screen.
+    # the pink xp bar at the top of the catch dialog. one of two
+    # signals we use for the catch screen.
     roi_catch_screen: tuple = (760, 80, 400, 80)
+    # backup catch-screen signal: the white "Press empty area to close"
+    # italic text near the bottom of the dialog. doesn't depend on the
+    # user's xp, time of day, fish type, or catch grade. always there,
+    # always white. the only thing that could false-fire is incidental
+    # bright-white pixels in this strip during normal fishing, which
+    # shouldn't happen at the player's feet on the dock.
+    roi_catch_text: tuple = (660, 920, 600, 60)
 
     # ---- color ranges ----
     # quick guide:
@@ -117,12 +124,18 @@ class Config:
     reel_target_min_pixels: int = 25
     reel_target_stay_min_pixels: int = 5
     reel_slider_min_pixels: int = 5
-    # how much pink we need to see to call it a catch screen. the
-    # number varies a lot between users because in-game brightness /
-    # post-processing changes how saturated the pink xp bar is. dev's
-    # machine sees ~12000, some users see ~2000. the dialog when fading
-    # out shows ~700, so 1500 is in the safe zone between them.
-    catch_min_pixels: int = 1500
+    # how much pink we need to see to call it a catch screen. low
+    # because the xp bar's fill width depends on the user's xp level,
+    # so low-level users have very little pink on screen. set above any
+    # random pink noise (other states have 0). text detector below
+    # backs this up if pink truly fails.
+    catch_min_pixels: int = 50
+    # how many white pixels in roi_catch_text mean the dismissal text
+    # is showing. the text "Press empty area to close" is dozens of
+    # characters with anti-aliased white edges, so the real count is
+    # in the thousands. set conservatively to allow for font size
+    # variations across resolutions.
+    catch_text_min_pixels: int = 500
 
     # ---- reel controller ----
     # how close to the center counts as "good enough". fraction of the
