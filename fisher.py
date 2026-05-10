@@ -1,6 +1,4 @@
 """
-the brain.
-
 every tick we look at the screen and figure out which of these we're in:
 
     catch_screen > reeling > hook_ready > idle > unknown
@@ -27,7 +25,7 @@ import cv2
 import numpy as np
 import pydirectinput
 
-from config import Config
+from config import Config, REFERENCE_W, REFERENCE_H
 from vision import Vision
 
 # pydirectinput sleeps for a tiny moment between calls by default which
@@ -67,6 +65,10 @@ class Fisher:
         # this long. stops us from double-pressing while the game is
         # still drawing the new screen.
         self._action_lockout_until = 0.0
+        # which dismiss point to try next on the catch screen. cycles
+        # through cfg.catch_dismiss_points, resets when we leave the
+        # catch screen state.
+        self._catch_dismiss_attempt = 0
 
     # ---- outside controls ----
 
@@ -337,9 +339,19 @@ class Fisher:
             return f"centered(release) center={target_center:.0f}"
 
     def _do_catch_screen(self):
-        cx, cy = self.cfg.catch_dismiss_point
-        print(f"[catch] dismissing, click @ window({cx},{cy})")
+        # cycle through the fallback points so if the first one doesn't
+        # actually dismiss the dialog we'll try a different spot next time
+        points = self.cfg.catch_dismiss_points
+        cx_ref, cy_ref = points[self._catch_dismiss_attempt % len(points)]
+        # scale 1920x1080 ref coords to the actual window size, same way
+        # rois are scaled
+        w = self.vision.window
+        cx = int(cx_ref * w.width / REFERENCE_W)
+        cy = int(cy_ref * w.height / REFERENCE_H)
+        print(f"[catch] dismissing #{self._catch_dismiss_attempt + 1}, "
+              f"click @ window({cx},{cy})")
         self._click_window(cx, cy)
+        self._catch_dismiss_attempt += 1
         # wait a sec for the dialog to close
         self._action_lockout_until = time.monotonic() + self.cfg.catch_dismiss_delay
 
@@ -378,6 +390,10 @@ class Fisher:
         # detection succeeds.
         if new == State.CATCH_SCREEN and prev == State.REELING:
             self._catches += 1
+        # reset the dismiss-attempt counter when we leave the catch
+        # screen so the next catch starts fresh from the first point
+        if prev == State.CATCH_SCREEN and new != State.CATCH_SCREEN:
+            self._catch_dismiss_attempt = 0
         print(f"[state] {prev.value} -> {new.value}")
 
     def run(self):

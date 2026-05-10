@@ -1,6 +1,4 @@
 """
-all the knobs.
-
 rois are written in 1920x1080 numbers. they get scaled to the actual
 window size at runtime, so the same numbers work no matter what
 resolution you play at, as long as the in-game ui scale is the same.
@@ -134,12 +132,19 @@ class Config:
     reel_log_seconds: float = 0.25       # how often to print the reel debug line
 
     # ---- closing the catch dialog ----
-    # where to click to dismiss it (window-relative). don't pick (100,
-    # 100) because the friends list / streamer indicators on the idle
-    # screen are around there and clicking them opens menus that throw
-    # us off. (50, 540) is below all that.
-    catch_dismiss_point: tuple = (50, 540)
-    catch_max_dismiss_attempts: int = 3
+    # places to click to dismiss it, in 1920x1080 reference space (same
+    # coordinate system as the rois). we try them in order, cycling on
+    # each retry, in case the first one lands on something that doesn't
+    # actually dismiss on someone's setup.
+    # (37, 405) is the ref-space version of (50, 540) at 2560x1440,
+    # which is what the dev tested with. the rest are spread-out
+    # fallbacks in spots that look empty.
+    catch_dismiss_points: tuple = (
+        (37, 405),    # left side, mid-height
+        (10, 700),    # bottom-left, below the friends list
+        (1200, 950),  # bottom center
+        (1850, 600),  # right side, mid-height
+    )
     # the dialog takes about a second to fade out. wait long enough that
     # we don't immediately think we're still on the catch screen.
     catch_dismiss_delay: float = 1.5

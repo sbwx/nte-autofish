@@ -14,6 +14,19 @@ import argparse
 import sys
 import time
 
+# tell windows we know how to handle our own pixel coordinates so it
+# doesn't silently rescale our mouse moves on machines with display
+# scaling above 100%. has to happen before pydirectinput is loaded.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 import keyboard
 
 from config import Config
