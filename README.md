@@ -7,7 +7,7 @@ bites, dismisses the catch screen, repeat. Does not auto buy bait or anything so
 
 ## install
 
-written for windows. double-click **install.bat**.
+written for Windows 11. double-click **install.bat**.
 
 it checks for python, installs it via winget if missing, makes a venv
 and installs the packages.
