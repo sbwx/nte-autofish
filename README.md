@@ -7,28 +7,14 @@ bites, dismisses the catch screen, repeat. Does not auto buy bait or anything so
 
 ## install
 
-windows only.
+windows only. double-click **install.bat**.
 
-from a fresh windows machine:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-this checks for python, installs it via winget if missing, makes a venv
+it checks for python, installs it via winget if missing, makes a venv
 and installs the packages.
-
-if you already have python:
-
-```bash
-pip install -r requirements.txt
-```
 
 ## run
 
-```bash
-python main.py
-```
+double-click **run.bat**.
 
 you have 4 seconds to open up the game window before it starts.
 
