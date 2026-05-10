@@ -1,0 +1,6 @@
+mss>=9.0.1
+opencv-python>=4.9.0
+numpy>=1.26.0
+pydirectinput>=1.0.4
+keyboard>=0.13.5
+pygetwindow>=0.0.9
