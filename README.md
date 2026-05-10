@@ -5,7 +5,7 @@ auto fishing script for neverness to everness.
 watches the screen, casts when it can, plays the minigame when a fish
 bites, dismisses the catch screen, repeat. Does not auto buy bait or anything so buy a ton of bait before leaving it running.
 
-## Installing
+## Installation
 
 written for Windows 11. double-click **install.bat**.
 
