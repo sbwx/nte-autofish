@@ -1,19 +1,19 @@
 """
-Reactive state machine for the NTE auto-fisher.
+the brain.
 
-Rather than progressing through cast → wait → reel → dismiss in strict order,
-each tick we ask "what state is the game in *right now*?" by polling all four
-detectors and acting on the highest-priority one that fires:
+every tick we look at the screen and figure out which of these we're in:
 
-    CATCH_SCREEN  > REELING > HOOK_READY > IDLE > UNKNOWN
+    catch_screen > reeling > hook_ready > idle > unknown
 
-This way a flaky detector for one state doesn't break the others — if IDLE
-ever misfires, the script will still react when the gauge or the catch dialog
-appears, and pick up the next IDLE on its own.
+then we do whatever that state needs. priority is left to right above,
+so e.g. if the catch screen is up we don't try to detect anything else.
 
-External signals:
-    panic   — hard stop, exits run().
-    paused  — soft pause; loop idles until cleared.
+if one of the checks is broken, the others still work. the script will
+just skip whatever's broken and pick up at the next thing it can see.
+
+global signals:
+    panic   stop everything and exit
+    paused  freeze the loop until unpaused
 """
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ import pydirectinput
 from config import Config
 from vision import Vision
 
-# pydirectinput's per-call sleep is unhelpful for the tight reel loop.
+# pydirectinput sleeps for a tiny moment between calls by default which
+# is bad for the fast reel loop, so turn it off
 pydirectinput.PAUSE = 0.0
 
 
@@ -49,23 +50,25 @@ class Fisher:
         self.state = State.UNKNOWN
         self._panic = threading.Event()
         self._paused = threading.Event()
-        # Independent flags — A and D can never be held simultaneously by
-        # design, but tracking them separately makes _force_release_all simple.
+        # A and D are tracked separately so we can lift them one at a
+        # time on exit
         self._a_down = False
         self._d_down = False
-        # Reel controller continuity across ticks.
+        # remember the last known slider/target spot, used as a fallback
+        # if the current frame can't see them
         self._last_slider_x: Optional[float] = None
         self._last_target_span: Optional[tuple] = None
-        # Counters / diagnostics.
+        # counters
         self._catches = 0
         self._misses = 0
         self._last_diag_log = 0.0
         self._last_reel_log = 0.0
-        # When set, suppress action on lower-priority states until this time
-        # (used to give the game a beat to repaint after we press a key).
+        # after pressing a key, ignore the next few state checks for
+        # this long. stops us from double-pressing while the game is
+        # still drawing the new screen.
         self._action_lockout_until = 0.0
 
-    # ---- External controls ----
+    # ---- outside controls ----
 
     def panic(self):
         self._panic.set()
@@ -78,7 +81,7 @@ class Fisher:
             self._paused.set()
             print("[fisher] paused")
 
-    # ---- Input wrappers ----
+    # ---- key/mouse stuff ----
 
     def _press(self, key: str):
         pydirectinput.press(key)
@@ -120,11 +123,9 @@ class Fisher:
                 setattr(self, attr, False)
 
     def _click_window(self, wx: int, wy: int):
-        """Move + mouseDown + small hold + mouseUp at a window-relative point.
-
-        Some Unity-based titles ignore pydirectinput.click() because it doesn't
-        produce a real cursor movement event before the click. The explicit
-        moveTo + mouseDown/Up sequence below is more reliable.
+        """move the mouse, hold the button briefly, let go.
+        the explicit move/down/up sequence is more reliable than
+        pydirectinput.click() against some unity games.
         """
         sx, sy = self.vision.window_to_screen(wx, wy)
         try:
@@ -136,7 +137,7 @@ class Fisher:
         except Exception as e:
             print(f"[click] failed at ({sx},{sy}): {e}")
 
-    # ---- Helpers ----
+    # ---- helpers ----
 
     def _sleep_interruptible(self, seconds: float) -> bool:
         end = time.monotonic() + seconds
@@ -163,15 +164,37 @@ class Fisher:
             self.vision.show_debug(debug_name, mask)
         return int(cv2.countNonZero(mask))
 
-    # ---- State detection ----
+    def _apply_edge_mask(self, mask: np.ndarray) -> None:
+        """zero out the leftmost/rightmost few pixels.
+        the bar has icons on either end with the same colors as the
+        slider, this just chops them off so they don't confuse us.
+        """
+        edge = self.cfg.reel_edge_mask_px
+        if edge > 0 and mask.shape[1] > 2 * edge:
+            mask[:, :edge] = 0
+            mask[:, -edge:] = 0
+
+    def _reel_target_count(self, debug_name: Optional[str] = None) -> int:
+        """count only the biggest teal chunk. the right-side icon also
+        has some teal but it's tiny next to the actual target rectangle,
+        so picking the biggest chunk ignores it."""
+        roi = self.vision.grab_roi(self.cfg.roi_reel_gauge)
+        if roi.size == 0:
+            return 0
+        mask = self.vision.hsv_mask(roi, self.cfg.hsv_target_zone)
+        if debug_name and self.cfg.debug_mode:
+            self.vision.show_debug(debug_name, mask)
+        _, area = self.vision.largest_blob_extent(mask)
+        return area
+
+    # ---- figuring out what state we're in ----
 
     def _detect_state(self) -> tuple:
-        """Return (state, diagnostics dict). Detector order = priority."""
+        """returns (state, dict of how many pixels each check saw)."""
         diag = {}
 
-        # CATCH first — when the dialog is up it covers most of the screen
-        # and overlaps with everything else. A positive catch detection
-        # means we should not act on any other ROI's noise.
+        # check the catch screen first. when it's up it covers most of
+        # the screen so we don't want to act on anything else.
         catch_px = self._mask_count(
             self.cfg.roi_catch_screen, self.cfg.hsv_catch_xp_bar, "catch_screen"
         )
@@ -179,13 +202,11 @@ class Fisher:
         if catch_px >= self.cfg.catch_min_pixels:
             return State.CATCH_SCREEN, diag
 
-        # REELING — teal target segment in the bar is unique to the minigame.
-        # Asymmetric hysteresis: high bar to ENTER, low bar to STAY. Stops
-        # the state from bouncing reeling↔unknown when the target briefly
-        # slides off the ROI edge.
-        reel_px = self._mask_count(
-            self.cfg.roi_reel_gauge, self.cfg.hsv_target_zone, "reel_target"
-        )
+        # reeling. teal target only shows up during the minigame.
+        # different thresholds for entering vs staying so we don't
+        # bounce in and out of state when the target slides off the edge
+        # for a frame.
+        reel_px = self._reel_target_count("reel_target")
         diag["reel_target"] = reel_px
         threshold = (
             self.cfg.reel_target_stay_min_pixels
@@ -195,8 +216,8 @@ class Fisher:
         if reel_px >= threshold:
             return State.REELING, diag
 
-        # HOOK_READY — bright blue ring around F bubble. Check before IDLE
-        # because the F bubble is also part of the action-bubble row.
+        # check for the blue ring before checking idle, because the F
+        # bubble is part of the bubble row too.
         hook_px = self._mask_count(
             self.cfg.roi_hook_button, self.cfg.hsv_hook_outline, "hook_outline"
         )
@@ -204,7 +225,8 @@ class Fisher:
         if hook_px >= self.cfg.hook_min_pixels:
             return State.HOOK_READY, diag
 
-        # IDLE — multiple white icons across the action-bubble row.
+        # idle: enough white pixels in the bubble row to mean all the
+        # icons are there
         idle_px = self._mask_count(
             self.cfg.roi_action_bubbles, self.cfg.hsv_bubble_icon, "bubble_icons"
         )
@@ -223,19 +245,19 @@ class Fisher:
         held = ("A" if self._a_down else "-") + ("D" if self._d_down else "-")
         print(f"[diag] state={detected.value} keys={held} {parts}")
 
-    # ---- Per-state actions ----
+    # ---- what to do in each state ----
 
     def _do_idle(self):
-        print(f"[idle] action bubbles visible — pressing {self.cfg.cast_key}")
+        print(f"[idle] action bubbles visible, pressing {self.cfg.cast_key}")
         self._press(self.cfg.cast_key)
         self._action_lockout_until = time.monotonic() + random.uniform(
             self.cfg.post_cast_min_delay, self.cfg.post_cast_max_delay
         )
 
     def _do_hook_ready(self):
-        print(f"[hook] blue ring detected — pressing {self.cfg.hook_key}")
+        print(f"[hook] blue ring detected, pressing {self.cfg.hook_key}")
         self._press(self.cfg.hook_key)
-        # Give the game time to bring up the minigame UI before the next tick.
+        # give the game a moment to bring up the minigame
         self._action_lockout_until = time.monotonic() + 0.6
 
     def _do_reel_tick(self):
@@ -245,25 +267,24 @@ class Fisher:
         target_mask = self.vision.hsv_mask(roi, self.cfg.hsv_target_zone)
         slider_mask = self.vision.hsv_mask(roi, self.cfg.hsv_slider)
 
-        target_span = self.vision.horizontal_extent(target_mask)
-        slider_centroid = self.vision.centroid(slider_mask)
+        # for the slider, chop off the edges where the yellow icon ring
+        # would be
+        self._apply_edge_mask(slider_mask)
+        # for the target, don't chop. instead we pick the biggest teal
+        # chunk below, which ignores the small teal bits on the icons.
+        # not chopping is what lets the target reach the actual edges of
+        # the bar instead of being cut short.
 
-        target_pixels = int(cv2.countNonZero(target_mask))
-        slider_pixels = int(cv2.countNonZero(slider_mask))
-
-        # Reject suspiciously wide target spans — if the teal mask matches
-        # most of the ROI we're picking up noise (sky/water bleed), not the
-        # actual segment.
-        if target_span is not None:
-            span_w = target_span[1] - target_span[0]
-            if span_w > self.cfg.reel_target_max_span_ratio * roi.shape[1]:
-                target_span = None
+        target_span, target_pixels = self.vision.largest_blob_extent(target_mask)
+        slider_centroid, slider_pixels = self.vision.largest_blob_centroid(slider_mask)
 
         if target_span is not None:
             self._last_target_span = target_span
         if slider_centroid is not None and slider_pixels >= self.cfg.reel_slider_min_pixels:
             self._last_slider_x = slider_centroid[0]
 
+        # use what we just saw, or fall back to the last known position
+        # if this frame couldn't see anything
         span = target_span or self._last_target_span
         slider_x = (
             slider_centroid[0]
@@ -294,13 +315,11 @@ class Fisher:
               f" span={span_s} slider_x={sx_s} keys={held} -> {decision}")
 
     def _apply_controller(self, roi_w: int, target_span: tuple, slider_x: float) -> str:
-        """Aim the slider at the *center* of the target zone.
-
-        Pushing toward the band edges (the previous behaviour) leaves the
-        slider resting against the inside edge of the band — and as the
-        band drifts, that edge becomes the outside, so the slider is
-        constantly almost-out. Pushing toward the center keeps the slider
-        in the middle, where it has maximum margin in both directions.
+        """push the slider toward the middle of the teal target.
+        if we just push toward the band edges, the slider sits on the
+        inside of the edge, and as the band moves that edge becomes the
+        outside and we're suddenly out. aiming for the middle gives us
+        room on both sides.
         """
         t_start, t_end = target_span
         target_center = (t_start + t_end) / 2.0
@@ -319,12 +338,12 @@ class Fisher:
 
     def _do_catch_screen(self):
         cx, cy = self.cfg.catch_dismiss_point
-        print(f"[catch] dismissing — click @ window({cx},{cy})")
+        print(f"[catch] dismissing, click @ window({cx},{cy})")
         self._click_window(cx, cy)
-        # Don't poll again immediately; give the dialog a moment to close.
+        # wait a sec for the dialog to close
         self._action_lockout_until = time.monotonic() + self.cfg.catch_dismiss_delay
 
-    # ---- Reel debug rendering ----
+    # ---- debug drawing for the reel ----
 
     def _render_debug(self, roi, target_mask, slider_mask, span, slider_x):
         vis = roi.copy()
@@ -344,20 +363,19 @@ class Fisher:
         pad_m = np.zeros((h, masks.shape[1], 3), dtype=np.uint8); pad_m[:masks.shape[0]] = masks
         self.vision.show_debug("reel_gauge", np.hstack([pad_v, pad_m]))
 
-    # ---- Main loop ----
+    # ---- main loop ----
 
     def _on_state_transition(self, prev: State, new: State):
         if prev == new:
             return
-        # Always lift reel keys when leaving REELING.
+        # always let go of A and D when we leave reeling
         if prev == State.REELING:
             self._release_reel_keys()
-        # Don't clear _last_slider_x / _last_target_span here — keep them as
-        # a warm cache. If the next reel starts within a few seconds (very
-        # common, since brief detection dips can briefly drop us out of
-        # REELING and right back in), the controller has fallback values
-        # for the first few ticks until fresh detections arrive. Stale
-        # values get overwritten on the first successful detection.
+        # we deliberately don't wipe _last_slider_x or _last_target_span
+        # here. they're used as a fallback so brief detection blips
+        # don't leave the controller blank for a tick or two when we
+        # come back. stale values get overwritten as soon as a real
+        # detection succeeds.
         if new == State.CATCH_SCREEN and prev == State.REELING:
             self._catches += 1
         print(f"[state] {prev.value} -> {new.value}")
@@ -377,13 +395,11 @@ class Fisher:
                     self._on_state_transition(self.state, detected)
                     self.state = detected
 
-                # REELING and (sometimes) CATCH_SCREEN run regardless of
-                # lockout — they're real states the game is in, not actions
-                # we just took. IDLE and HOOK_READY presses honor lockout so
-                # we don't double-press while the game repaints.
-                respect_lockout = detected in (State.IDLE, State.HOOK_READY)
                 in_lockout = tick_start < self._action_lockout_until
 
+                # reeling runs every tick no matter what. the game is
+                # driving the bar, not us, and the controller needs to
+                # see every frame.
                 if detected == State.REELING:
                     self._do_reel_tick()
                     elapsed = time.monotonic() - tick_start
@@ -392,12 +408,16 @@ class Fisher:
                         time.sleep(remain)
                     continue
 
+                # the click respects the lockout so we don't spam clicks
+                # while the dialog is still fading
                 if detected == State.CATCH_SCREEN:
                     if not in_lockout:
                         self._do_catch_screen()
                     self._sleep_interruptible(self.cfg.catch_poll_seconds)
                     continue
 
+                # idle and hook also respect the lockout so we don't
+                # double-press while the game is still drawing
                 if detected == State.HOOK_READY:
                     if not in_lockout:
                         self._do_hook_ready()
@@ -410,7 +430,7 @@ class Fisher:
                     self._sleep_interruptible(self.cfg.cast_poll_seconds)
                     continue
 
-                # UNKNOWN — slow poll, do nothing.
+                # nothing detected. wait a bit and try again.
                 self._sleep_interruptible(0.15)
         finally:
             self._force_release_all()

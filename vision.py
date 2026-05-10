@@ -1,8 +1,8 @@
 """
-Capture + image processing for the NTE auto-fisher.
+screen capture + image checks.
 
-Vision is intentionally stateless aside from the capture thread: the Fisher
-state machine asks for a fresh frame and runs detectors on a chosen ROI.
+stateless apart from the capture thread. fisher asks for a fresh frame
+and runs whatever check it wants on whatever bit of the screen it wants.
 """
 from __future__ import annotations
 
@@ -32,7 +32,8 @@ class WindowBox:
     height: int
 
     def scale_roi(self, roi_ref: tuple) -> tuple:
-        """Map an ROI authored in 1920x1080 space into this window's pixel space."""
+        """take an roi written in 1920x1080 numbers and rescale it to
+        wherever the window actually is."""
         x, y, w, h = roi_ref
         sx = self.width / REFERENCE_W
         sy = self.height / REFERENCE_H
@@ -61,10 +62,9 @@ def primary_monitor_box() -> WindowBox:
 
 
 class _CaptureThread(threading.Thread):
-    """Background grabber that keeps the latest frame in a single slot.
-
-    We deliberately drop frames — the state machine only ever wants the most
-    recent one. A queue would let the consumer fall behind during slow ticks.
+    """grabs frames in the background, only keeps the newest one.
+    old frames are thrown away on purpose, we never want to look at
+    anything but the most recent thing on screen.
     """
     def __init__(self, monitor: dict):
         super().__init__(daemon=True)
@@ -120,14 +120,14 @@ class Vision:
         }
         self._thread = _CaptureThread(mon)
         self._thread.start()
-        # Spin briefly so the first .latest() returns a frame.
+        # wait a tiny bit so the first call gets a frame back
         for _ in range(50):
             if self._thread.latest() is not None:
                 break
             time.sleep(0.01)
 
     def relocate(self) -> None:
-        """Re-find the game window. Call if the user moved/resized the game."""
+        """find the window again. call this if the game got moved or resized."""
         if self._thread:
             self._thread.stop()
             self._thread = None
@@ -135,14 +135,14 @@ class Vision:
         if self.cfg.use_capture_thread:
             self._start_thread()
 
-    # ---- Capture ----
+    # ---- capture ----
 
     def grab_full(self) -> np.ndarray:
         if self._thread is not None:
             f = self._thread.latest()
             if f is not None:
                 return f
-        # Fallback: synchronous grab of the whole window.
+        # backup: just grab the window directly right now
         mon = {
             "left": self.window.left,
             "top": self.window.top,
@@ -153,30 +153,29 @@ class Vision:
         return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
     def window_to_screen(self, x: int, y: int) -> tuple:
-        """Convert window-relative pixel coords to absolute screen coords."""
+        """turn a point inside the window into a point on the whole screen."""
         return (self.window.left + int(x), self.window.top + int(y))
 
     def grab_roi(self, roi_ref: tuple) -> np.ndarray:
-        """Crop the latest full frame to a reference-space ROI."""
+        """cut out a chunk of the latest frame using a 1920x1080-style roi."""
         full = self.grab_full()
         x, y, w, h = self.window.scale_roi(roi_ref)
-        # Convert from screen-space to frame-space (frame is window-local).
+        # convert from screen coords to coords inside this frame
         x0 = max(0, x - self.window.left)
         y0 = max(0, y - self.window.top)
         x1 = min(full.shape[1], x0 + w)
         y1 = min(full.shape[0], y0 + h)
         return full[y0:y1, x0:x1]
 
-    # ---- Detectors ----
+    # ---- image checks ----
 
     @staticmethod
     def hsv_mask(bgr: np.ndarray, rng: HSVRange) -> np.ndarray:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         lower, upper = rng.as_arrays()
         if rng.wrap:
-            # Hue wraps at 180 (e.g. red lives near 0 and near 180). We treat
-            # the supplied range as the low band [0..upper_h] and mirror it to
-            # the high band [180-upper_h .. 180], reusing S/V on both sides.
+            # red lives at both ends of the hue wheel, so we have to
+            # match two ranges and OR them together
             low_a = np.array([0, lower[1], lower[2]], dtype=np.uint8)
             high_a = np.array([upper[0], upper[1], upper[2]], dtype=np.uint8)
             low_b = np.array([180 - upper[0], lower[1], lower[2]], dtype=np.uint8)
@@ -185,14 +184,14 @@ class Vision:
                                   cv2.inRange(hsv, low_b, high_b))
         else:
             mask = cv2.inRange(hsv, lower, upper)
-        # Light morphology to kill compression speckle without eating the target.
+        # smooth out tiny noise pixels without eating real stuff
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         return mask
 
     @staticmethod
     def centroid(mask: np.ndarray) -> Optional[tuple]:
-        """Return (cx, cy) of the largest contiguous blob in `mask`, or None."""
+        """middle point of all matching pixels. none if nothing matched."""
         m = cv2.moments(mask)
         if m["m00"] < 1:
             return None
@@ -200,20 +199,48 @@ class Vision:
 
     @staticmethod
     def horizontal_extent(mask: np.ndarray) -> Optional[tuple]:
-        """Return (x_start, x_end) — leftmost and rightmost lit columns.
-
-        Used to find the target zone's horizontal span on the gauge.
-        """
+        """leftmost and rightmost matching column."""
         cols = np.where(mask.any(axis=0))[0]
         if cols.size == 0:
             return None
         return (int(cols[0]), int(cols[-1]))
 
+    @staticmethod
+    def largest_blob_extent(mask: np.ndarray):
+        """left and right edges, plus pixel count, of the biggest matching
+        chunk. returns (none, 0) if nothing matched.
+        useful when there might be more than one matching thing and you
+        only want the biggest (e.g. ignoring small bits of color from
+        the icons next to the bar).
+        """
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n_labels <= 1:
+            return None, 0
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        idx = 1 + int(np.argmax(areas))
+        x = int(stats[idx, cv2.CC_STAT_LEFT])
+        w = int(stats[idx, cv2.CC_STAT_WIDTH])
+        return (x, x + w - 1), int(stats[idx, cv2.CC_STAT_AREA])
+
+    @staticmethod
+    def largest_blob_centroid(mask: np.ndarray):
+        """middle point and pixel count of the biggest matching chunk.
+        returns (none, 0) if nothing matched. won't get pulled off by
+        small bits of noise the way a global average would.
+        """
+        n_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n_labels <= 1:
+            return None, 0
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        idx = 1 + int(np.argmax(areas))
+        cx, cy = centroids[idx]
+        return (float(cx), float(cy)), int(stats[idx, cv2.CC_STAT_AREA])
+
     def color_present(self, bgr: np.ndarray, rng: HSVRange, min_pixels: int) -> bool:
         mask = self.hsv_mask(bgr, rng)
         return int(cv2.countNonZero(mask)) >= min_pixels
 
-    # ---- Debug ----
+    # ---- debug ----
 
     def show_debug(self, name: str, img: np.ndarray):
         if not self.cfg.debug_mode:

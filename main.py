@@ -1,21 +1,17 @@
 """
-Entry point for the NTE auto-fisher.
+run: python main.py [--debug]
 
-Run: python main.py [--debug]
+hotkeys:
+    F9   stop
+    F10  pause / resume
 
-Hotkeys:
-    F9   — panic stop (exits immediately)
-    F10  — pause / resume
-
-The script focuses the game window? No — it does not. Bring the game to the
-foreground yourself before starting; pydirectinput sends keys to whichever
-window currently has focus.
+we don't focus the game window for you. click on the game first, then
+the script will start sending keys to whatever window is in focus.
 """
 from __future__ import annotations
 
 import argparse
 import sys
-import threading
 import time
 
 import keyboard
@@ -28,11 +24,11 @@ from vision import Vision
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="NTE auto-fisher")
     p.add_argument("--debug", action="store_true",
-                   help="Show OpenCV debug windows for each ROI mask.")
+                   help="show opencv windows of what the script sees")
     p.add_argument("--no-thread", action="store_true",
-                   help="Disable the background capture thread (debugging).")
+                   help="grab frames in the foreground (for debugging)")
     p.add_argument("--countdown", type=int, default=4,
-                   help="Seconds to wait before starting (focus the game).")
+                   help="seconds to wait before starting (so you can focus the game)")
     return p.parse_args()
 
 
@@ -43,7 +39,7 @@ def install_hotkeys(fisher: Fisher, cfg: Config) -> None:
 
 def countdown(seconds: int):
     for i in range(seconds, 0, -1):
-        print(f"  starting in {i}…")
+        print(f"  starting in {i}...")
         time.sleep(1)
 
 
