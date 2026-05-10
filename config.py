@@ -117,10 +117,12 @@ class Config:
     reel_target_min_pixels: int = 25
     reel_target_stay_min_pixels: int = 5
     reel_slider_min_pixels: int = 5
-    # real catch dialogs have 10k+ pink pixels. high threshold so the
-    # fading dialog and any small pink ui (LIVE indicators etc) don't
-    # trigger it.
-    catch_min_pixels: int = 3000
+    # how much pink we need to see to call it a catch screen. the
+    # number varies a lot between users because in-game brightness /
+    # post-processing changes how saturated the pink xp bar is. dev's
+    # machine sees ~12000, some users see ~2000. the dialog when fading
+    # out shows ~700, so 1500 is in the safe zone between them.
+    catch_min_pixels: int = 1500
 
     # ---- reel controller ----
     # how close to the center counts as "good enough". fraction of the
